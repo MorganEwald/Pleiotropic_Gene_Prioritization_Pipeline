@@ -1,0 +1,587 @@
+---
+title: "Pleiotropic_Gene_Prioritization_Pipeline_Final"
+author: "Morgan Ewald, Michael Kuehn, Olivia Veatch"
+date: "2025-04-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+For all steps not able to be completed directly in R, the websites are linked and instructions provided.
+This protocol is divided into 5 sections: 
+1) Selection of variants
+2) Mapping GWAS hits to genes
+3) Determining functional relevance
+4) Identifying overall systems
+5) Defining final prioritized gene set
+
+######## Set-up ########
+Load libraries
+```{r, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(readr)
+library(gwasrapidd)
+library(BiocManager)
+library(biomaRt)
+library(jsonlite)
+library(httr)
+library(ggplot2)
+library(ghql)
+library(STRINGdb)
+library(curl)
+```
+######## Section 1: Selection of Variants ########
+Pull all traits from GWAS catalog (https://www.ebi.ac.uk/gwas/)
+```{r}
+all_traits <- get_traits()
+```
+Select phenotypes of interest by defining text strings to search 'all_traits', manually curate output, match to harmonized phenotype codes (e.g., Experimental Factor Ontology [EFO]), and initialize data frames for pulling variants
+```{r}
+trait1 <- c('sleep duration', 'sleep quality', 'sleep depth', 'sleep latency', 'efficiency', 'wake after sleep onset', 'insomnia')  #modify according to phenotype of interest
+trait1.efos <- data.frame()
+for (term in trait1) {
+  filtered_data <- dplyr::filter(all_traits@traits, grepl(term, trait, ignore.case=TRUE))
+  trait1.efos <- rbind(trait1.efos, filtered_data)
+} 
+trait1.efos <- dplyr::select(trait1.efos, -uri)
+trait1.efo.codes <- trait1.efos$efo_id
+trait1.combined.tbl.riskallele <- data.frame()
+trait1.combined.tbl.assoc <- data.frame()
+
+trait2 <- c('schizophrenia') #modify according to phenotype of interest
+trait2.efos <- all_traits@traits %>%
+  dplyr::filter(grepl('^schizophrenia$', trait, ignore.case=TRUE)) %>%
+  dplyr::select(-uri)
+trait2.efo.codes <- trait2.efos$efo_id
+trait2.combined.tbl.riskallele <- data.frame()
+trait2.combined.tbl.assoc <- data.frame()
+#rm(all_traits)
+```
+
+Pull variants associated with selected EFO codes for traits 1 and 2 (NOTE: This step can take a long time to complete)
+```{r}
+#Trait 1
+for (efo_id in trait1.efo.codes) {
+  # Retrieve associations
+  associations <- get_associations(efo_id = trait1.efo.codes)
+  
+  # Select relevant columns from risk alleles and associations
+  tbl_riskallele <- dplyr::select(associations@risk_alleles,
+                                  association_id,
+                                  variant_id,
+                                  risk_allele)
+  tbl_assoc <- dplyr::select(
+    associations@associations,
+    association_id,
+    pvalue,
+    beta_number,
+    beta_unit,
+    beta_direction
+  )
+  
+  # Combine with the overall data frames
+  trait1.combined.tbl.riskallele <- bind_rows(trait1.combined.tbl.riskallele, tbl_riskallele)
+  trait1.combined.tbl.assoc <- bind_rows(trait1.combined.tbl.assoc, tbl_assoc)
+}
+
+#Combine the tables together by association_id and select variants associated at or below the currently accepted threshold for genome-wide significance
+trait1.selected.variants <- dplyr::left_join(trait1.combined.tbl.riskallele,
+                                             trait1.combined.tbl.assoc,
+                                             by = 'association_id') %>%
+  tidyr::drop_na() %>%
+  dplyr::filter(pvalue <= 5e-8)
+
+#Trait 2
+for (efo_id in trait2.efo.codes) {
+  #retrieve associations
+  associations <- get_associations(efo_id = trait2.efo.codes)
+  
+  # Select relevant columns from risk alleles and associations
+  tbl_riskallele <- dplyr::select(associations@risk_alleles,
+                                  association_id,
+                                  variant_id,
+                                  risk_allele)
+  tbl_assoc <- dplyr::select(
+    associations@associations,
+    association_id,
+    pvalue,
+    beta_number,
+    beta_unit,
+    beta_direction
+  )
+  
+  # Combine with the overall data frames
+  trait2.combined.tbl.riskallele <- bind_rows(trait2.combined.tbl.riskallele, tbl_riskallele)
+  trait2.combined.tbl.assoc <- bind_rows(trait2.combined.tbl.assoc, tbl_assoc)
+}
+#Combine the tables together by association_id and select variants associated at or below the currently accepted threshold for genome-wide significance
+trait2.selected.variants <- dplyr::left_join(trait2.combined.tbl.riskallele,
+                                             trait2.combined.tbl.assoc,
+                                             by = 'association_id') %>%
+  tidyr::drop_na() %>%
+  dplyr::filter(pvalue <= 5e-8)
+rm(associations, filtered_data, tbl_assoc, tbl_riskallele, trait1.combined.tbl.assoc,
+   trait1.combined.tbl.riskallele, trait1.efos, trait2.combined.tbl.assoc, 
+   trait2.combined.tbl.riskallele, trait2.efos)
+```
+
+Create output files for Section 2
+```{r}
+trait1.FUMA.input <- trait1.selected.variants %>% 
+  dplyr::select(rsID = variant_id, pvalue)
+trait2.FUMA.input <- trait2.selected.variants %>% 
+  dplyr::select(rsID = variant_id, pvalue)
+write.table(trait1.FUMA.input, file = 'trait1.FUMA.input.txt', sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(trait2.FUMA.input, file = 'trait2.FUMA.input.txt', sep = "\t", row.names = FALSE, quote = FALSE)
+```
+######## Section 2: Mapping GWAS hits to genes ########
+
+This section is done out side of R, in FUMA: https://fuma.ctglab.nl/ using the SNP2GENE function; SNP2GENE mapping should be run separately for each trait
+
+Specified parameters by section:
+1.'Upload input files'
+rsID: rsID
+P-value: pvalue
+
+2. 'Parameters for lead SNPs and candidate SNPs identification'
+Sample size (N): User specified and will vary based on original GWAS included in catalog, in this example protocol we chose to use the mean sample size for all GWAS conducted for each trait
+
+```{r}
+#Pull all studies for phenotype codes
+trait1.studies <- get_studies(efo_id = trait1.efo.codes)
+
+#Pull study id and sample size
+trait1.studies <- dplyr::select(trait1.studies@ancestries, study_id, number_of_individuals)
+trait1.studies <- trait1.studies %>%
+  group_by(as.factor(study_id)) %>%
+  mutate(meansamplesize=mean(number_of_individuals)) %>%
+  distinct(study_id, meansamplesize) %>%
+  ungroup() %>%
+  mutate(meansamplesize=mean(meansamplesize)) %>%
+  distinct(meansamplesize)
+
+trait2.studies <- get_studies(efo_id = trait2.efo.codes)
+trait2.studies <- dplyr::select(trait2.studies@ancestries, study_id, number_of_individuals)
+trait2.studies <- trait2.studies %>%
+  group_by(as.factor(study_id)) %>%
+  mutate(meansamplesize=mean(number_of_individuals)) %>%
+  distinct(study_id, meansamplesize) %>%
+  ungroup() %>%
+  mutate(meansamplesize=mean(meansamplesize)) %>%
+  distinct(meansamplesize)
+```
+
+3-1. 'Gene Mapping (positional mapping)'
+
+Check box to perform positional mapping
+15-core chromatin state: Select Brain tissue
+Under additional annotations, select relevant tissue based on traits
+
+3-2. 'Gene Mapping (eQTL mapping)'
+
+Check box to perform eQTL mapping
+Tissue types: select relevant tissue based on traits of interest
+15-core chromatin state: Select relevant tissue based on traits of interest
+Under additional annotations, select relevant tissue based on traits of interest
+
+3-3. 'Gene Mapping (3D Chromatin Interaction mapping)
+
+Check box to perform chromatin interaction mapping
+Builtin chromatin interaction data select relevant tissue based on traits of interest
+
+Promoter region window: 250-500
+Annotate enhancer/promoter regions (Roadmap 111 epigenomes): Select relevant tissue based on traits of interest
+15-core chromatin state: Select relevant tissue based on traits of interest
+Under additional annotations, select relevant tissue based on traits of interest
+
+4. Gene types
+Ensembl version v110
+Select protein coding
+
+5. MHC region
+Check box to exclude MHC region from only annotations
+
+6. MAGMA analysis
+Check box to perform MAGMA 
+MAGMA gene expression analysis: select GTEx v8: 54 tissue types and 30 general tissue types
+
+Read both FUMA output files titled 'genes' into R, to find this file click the dropdown under your login name in the upper right corner of the FUMA browser window and click on 'SNP2GENE My Jobs' (https://fuma.ctglab.nl/snp2gene#joblist-panel), find the job of interest and download the gene table
+```{r}
+rm(list=ls()) #at this point the environment can be cleared to ensure faster downstream applications
+trait1.genes <- read.table('./example.files.for.protocol/trait1.genes.txt', header = TRUE)
+trait2.genes <- read.table('./example.files.for.protocol/trait2.genes.txt', header = TRUE)
+```
+
+Merge the two data frames together, keeping only gene IDs that appear in both data frames
+```{r}
+matched.genes <- merge(trait1.genes, trait2.genes, by = "ensg", all = FALSE)
+#clean up file for ease
+matched.genes <- matched.genes %>%
+  mutate(symbol=as.factor(symbol.x), ensg=as.factor(ensg), chr=as.factor(chr.x), 
+         start=start.x, end=end.x, strand=as.factor(strand.x), type=as.factor(type.x),
+         entrezID=as.factor(entrezID.x)) %>%
+  dplyr::select(symbol, ensg, chr, start, end, strand, type, entrezID)
+#for downstream steps
+human.fuma.genes <- matched.genes%>%
+  rename(human_symbol = symbol) %>% 
+  rename(human_entrez = entrezID)
+```
+######## Section 3: Determining Functional Relevance ########
+
+Go to IMPC website, https://www.mousephenotype.org/, and create lists for mouse phenotypes (MP) related to your human phenotypes of interest. 
+MP:0008428
+MP:0001468
+MP:0002063
+MP:0009142
+MP:0009141
+MP:0003088
+MP:0001415
+MP:0002557
+MP:0001363
+MP:0001362
+MP:0001364
+MP:0003360
+MP:0011396
+
+In R, pull genes associated with MPs
+```{r}
+#Identify genes that when knocked out of mice are associated (p<0.05) with sleep-related traits (MP:0011396; https://www.mousephenotype.org/data/phenotypes/MP:0011396)
+AbnormalSleepMouse0.05 <- fromJSON('https://www.ebi.ac.uk/mi/impc/solr/genotype-phenotype/select?q=mp_term_id:%22MP:0011396%22AND%20p_value:%5b0%20TO%200.05%5d&rows=100000&wt=json&indent=1', flatten = TRUE)
+AbnormalSpatialWorkingMemory0.05 <- fromJSON('https://www.ebi.ac.uk/mi/impc/solr/genotype-phenotype/select?q=mp_term_id:%22MP:0008428%22AND%20p_value:%5b0%20TO%200.05%5d&rows=100000&wt=json&indent=1', flatten = TRUE)
+DecreasedPrepulseInhibition0.05 <- fromJSON('https://www.ebi.ac.uk/mi/impc/solr/genotype-phenotype/select?q=mp_term_id:%22MP:0009142%22AND%20p_value:%5b0%20TO%200.05%5d&rows=100000&wt=json&indent=1', flatten = TRUE)
+IncreasedPrepulseInhibition0.05 <- fromJSON('https://www.ebi.ac.uk/mi/impc/solr/genotype-phenotype/select?q=mp_term_id:%22MP:0009141%22AND%20p_value:%5b0%20TO%200.05%5d&rows=100000&wt=json&indent=1', flatten = TRUE)
+IncreasedExplorationInEnviron0.05 <- fromJSON('https://www.ebi.ac.uk/mi/impc/solr/genotype-phenotype/select?q=mp_term_id:%22MP:0001415%22AND%20p_value:%5b0%20TO%200.05%5d&rows=100000&wt=json&indent=1', flatten = TRUE)
+AbnormalSocialBehavior0.05 <- fromJSON('https://www.ebi.ac.uk/mi/impc/solr/genotype-phenotype/select?q=mp_term_id:%22MP:0002557%22AND%20p_value:%5b0%20TO%200.05%5d&rows=100000&wt=json&indent=1', flatten = TRUE)
+IncreasedAnxietyRelatedResponse0.05 <- fromJSON('https://www.ebi.ac.uk/mi/impc/solr/genotype-phenotype/select?q=mp_term_id:%22MP:0001363%22AND%20p_value:%5b0%20TO%200.05%5d&rows=100000&wt=json&indent=1', flatten = TRUE)
+AbnormalAnxietyRelatedResponse0.05 <- fromJSON('https://www.ebi.ac.uk/mi/impc/solr/genotype-phenotype/select?q=mp_term_id:%22MP:0001362%22AND%20p_value:%5b0%20TO%200.05%5d&rows=100000&wt=json&indent=1', flatten = TRUE)
+DecreasedAnxietyRelatedResponse0.05 <- fromJSON('https://www.ebi.ac.uk/mi/impc/solr/genotype-phenotype/select?q=mp_term_id:%22MP:0001364%22AND%20p_value:%5b0%20TO%200.05%5d&rows=100000&wt=json&indent=1', flatten = TRUE)
+```
+
+Reformat lists into data frames
+```{r}
+#Reformat lists to pull mouse gene names and phenotypic consequences in KOs 
+nsleep <- AbnormalSleepMouse0.05$response$numFound
+ntrait1<-data.frame(phenotype=AbnormalSleepMouse0.05$response$docs$mp_term_name[c(1:nsleep)],genes=AbnormalSleepMouse0.05$response$docs$marker_symbol[c(1:nsleep)], stringsAsFactors = FALSE)
+ntrait2_1 <- AbnormalSpatialWorkingMemory0.05$response$numFound
+ntrait2_2 <- DecreasedPrepulseInhibition0.05$response$numFound
+ntrait2_3 <- IncreasedPrepulseInhibition0.05$response$numFound
+ntrait2_4 <- IncreasedExplorationInEnviron0.05$response$numFound
+ntrait2_5 <- AbnormalSocialBehavior0.05$response$numFound
+ntrait2_6 <- IncreasedAnxietyRelatedResponse0.05$response$numFound
+ntrait2_7 <- AbnormalAnxietyRelatedResponse0.05$response$numFound
+ntrait2_8 <- DecreasedAnxietyRelatedResponse0.05$response$numFound
+
+ntrait2_1 <- data.frame(phenotype=AbnormalSpatialWorkingMemory0.05$response$docs$mp_term_name[c(1:ntrait2_1)],genes=AbnormalSpatialWorkingMemory0.05$response$docs$marker_symbol[c(1:ntrait2_1)], stringsAsFactors = FALSE)
+ntrait2_2 <- data.frame(phenotype=DecreasedPrepulseInhibition0.05$response$docs$mp_term_name[c(1:ntrait2_2)],genes=DecreasedPrepulseInhibition0.05$response$docs$marker_symbol[c(1:ntrait2_2)], stringsAsFactors = FALSE)
+ntrait2_3 <- data.frame(phenotype=IncreasedPrepulseInhibition0.05$response$docs$mp_term_name[c(1:ntrait2_3)],genes=IncreasedPrepulseInhibition0.05$response$docs$marker_symbol[c(1:ntrait2_3)], stringsAsFactors = FALSE)
+ntrait2_4 <- data.frame(phenotype=IncreasedExplorationInEnviron0.05$response$docs$mp_term_name[c(1:ntrait2_4)],genes=IncreasedExplorationInEnviron0.05$response$docs$marker_symbol[c(1:ntrait2_4)], stringsAsFactors = FALSE)
+ntrait2_5 <- data.frame(phenotype=AbnormalSocialBehavior0.05$response$docs$mp_term_name[c(1:ntrait2_5)],genes=AbnormalSocialBehavior0.05$response$docs$marker_symbol[c(1:ntrait2_5)], stringsAsFactors = FALSE)
+ntrait2_6 <- data.frame(phenotype=IncreasedAnxietyRelatedResponse0.05$response$docs$mp_term_name[c(1:ntrait2_6)],genes=IncreasedAnxietyRelatedResponse0.05$response$docs$marker_symbol[c(1:ntrait2_6)], stringsAsFactors = FALSE)
+ntrait2_7 <- data.frame(phenotype=AbnormalAnxietyRelatedResponse0.05$response$docs$mp_term_name[c(1:ntrait2_7)],genes=AbnormalAnxietyRelatedResponse0.05$response$docs$marker_symbol[c(1:ntrait2_7)], stringsAsFactors = FALSE)
+ntrait2_8 <- data.frame(phenotype=DecreasedAnxietyRelatedResponse0.05$response$docs$mp_term_name[c(1:ntrait2_8)],genes=DecreasedAnxietyRelatedResponse0.05$response$docs$marker_symbol[c(1:ntrait2_8)], stringsAsFactors = FALSE)
+```
+
+Join all results into one data frame. 
+```{r}
+MouseKOtraits <- distinct(full_join(ntrait1, ntrait2_1, by='genes'))
+MouseKOtraits <- distinct(full_join(MouseKOtraits, ntrait2_2, by='genes'))
+MouseKOtraits <- distinct(full_join(MouseKOtraits, ntrait2_3, by='genes'))
+MouseKOtraits <- distinct(full_join(MouseKOtraits, ntrait2_4, by='genes'))
+MouseKOtraits <- distinct(full_join(MouseKOtraits, ntrait2_5, by='genes'))
+MouseKOtraits <- distinct(full_join(MouseKOtraits, ntrait2_6, by='genes'))
+MouseKOtraits <- distinct(full_join(MouseKOtraits, ntrait2_7, by='genes'))
+MouseKOtraits <- distinct(full_join(MouseKOtraits, ntrait2_8, by='genes'))
+```
+
+Create a new column in the MouseKOtraits data frame to count the number of phenotypes associated with each gene.
+```{r}
+# Create a new column 'phenotype_count' to count the number of non-missing phenotypes
+MouseKOtraits <- MouseKOtraits %>%
+  mutate(phenotype_count = rowSums(!is.na(dplyr::select(., -genes))))
+
+# Sort the dataframe by 'phenotype_count' in descending order
+MouseKOtraits_sorted <- MouseKOtraits %>%
+  arrange(desc(phenotype_count))
+```
+
+#Pull entrezIDs from BiomaRt for mouse gene symbols
+```{r}
+ensembl <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+IMPC_mouse_genes <- MouseKOtraits$genes
+# Map gene symbols to Entrez IDs
+IMPC_mouse_entrezIDs <- getBM(
+  attributes = c("mgi_symbol", "entrezgene_id"),
+  filters = "mgi_symbol",
+  values = IMPC_mouse_genes,
+  mart = ensembl
+)
+
+```
+#Use DIOPT API to convert mouse genes into human orthologs.
+```{r}
+url <- 'https://www.flyrnai.org/tools/diopt/web/diopt_api/v9/get_orthologs_from_entrez/'
+inputspecies <- '10090'
+targetspecies <- '9606'
+entrezids_fordiopt <- filter(IMPC_mouse_entrezIDs, !is.na(entrezgene_id))
+orthologues <- NULL
+for (i in 1:nrow(entrezids_fordiopt)) {
+  orthologues[[paste0("entrezID", i)]] <- fromJSON(
+    paste0(url, inputspecies, '/', 
+           entrezids_fordiopt$entrezgene_id[[i]], 
+           '/', targetspecies, '/best_match'),
+    flatten=TRUE)
+  }
+```
+
+```{r}
+flatten_one_entry <- function(entry) {
+  # Extract mouse gene info
+  mouse_gene <- entry$search_details$gene_details
+  mouse_entrez <- as.character(mouse_gene$geneid)
+  mouse_symbol <- mouse_gene$symbol
+  # Extract orthologue results (can be multiple)
+  purrr::imap_dfr(entry$results, function(targets, mouse_id) {
+    purrr::imap_dfr(targets, function(info, human_id) {
+      tibble(
+        mouse_entrez = mouse_entrez,
+        mouse_symbol = mouse_symbol,
+        human_entrez = as.character(info$geneid),
+        human_symbol = info$symbol,
+        score = info$score,
+        max_score = info$max_score,
+        best_score = info$best_score,
+        best_score_rev = info$best_score_rev,
+        best_score_count = info$best_score_count,
+        confidence = info$confidence,
+        methods = paste(info$methods, collapse = ", ")
+      )
+    })
+  })
+}
+# Apply the function to all entries
+flat_df <- purrr::map_dfr(orthologues, flatten_one_entry)
+
+
+#remove missing values
+flat_df <- flat_df %>% 
+  mutate(confidence = as.factor(confidence))%>%
+  filter(!is.na(confidence) & confidence != "")
+```
+#clean output file
+```{r}
+DIOPT_results <- flat_df %>%
+  dplyr::select(
+    mouse_entrez, 
+    mouse_symbol, 
+    human_entrez, 
+    human_symbol, 
+    confidence
+  )
+```
+
+
+######## Identifying Overall Systems ########
+
+Adjust column names and formats. 
+```{r}
+human.IMPCKO.genes <- DIOPT_results %>% 
+  mutate(human_entrez = as.factor(human_entrez)) %>% 
+  mutate(human_symbol = as.factor(human_symbol)) 
+```
+Create a data frame that contains all human FUMA genes and all human IMPC KO genes for downstream steps. Take dataframe matched.genes for all human FUMA genes. 
+```{r}
+# Step 1: Select and rename columns from matched.genes
+matched.genes.renamed <- matched.genes %>%
+  dplyr::select(human_symbol = symbol, human_entrez = entrezID)
+
+# Step 2: Select only the relevant columns from human.IMPCKO.genes
+human.IMPCKO.cleaned <- human.IMPCKO.genes %>%
+  dplyr::select(human_entrez, human_symbol)
+
+# Step 3: Bind and keep only distinct human_entrez
+all.human.genes <- bind_rows(human.IMPCKO.cleaned, matched.genes.renamed) %>%
+  distinct(human_entrez, .keep_all = TRUE)
+```
+
+Check for any direct gene matches from FUMA GWAS hits and IMPC KO hits.
+```{r}
+easy.hits <- inner_join(human.fuma.genes, human.IMPCKO.genes, by= "human_symbol")
+```
+
+Load STRING database (https://string-db.org/). Rename data frames for easier use of code. Combine gene symbols with gene IDs into one data frame for mapping interaction predictions.
+```{r}
+string_db_human <- STRINGdb$new(version="12", species=9606, score_threshold=400, input_directory="")
+Trait1genesnames <- human.fuma.genes
+Trait2genesnames <- human.IMPCKO.genes
+Trait1genesentrezID <- distinct(Trait1genesnames, human_entrez)
+Trait2genesentrezID <- distinct(Trait2genesnames, human_entrez)
+Combinedgeneset <- rbind(Trait1genesentrezID, Trait2genesentrezID)
+Combinedgeneset <- distinct(Combinedgeneset)
+
+```
+Map Human.GeneIDs (EntrezIDs) to STRING.IDs.
+```{r}
+Combinedgeneset_mapped <- string_db_human$map(Combinedgeneset, "human_entrez", removeUnmappedRows = TRUE )
+duplicateSTRING <- Combinedgeneset_mapped %>% 
+  filter(duplicated(STRING_id) | duplicated(STRING_id, fromLast = TRUE))
+```
+Map the STRING.IDs to the STRING database to get predicted interactions. Filter out low confidence scores less than 400. Settings based on information: https://string-db.org/cgi/input?sessionId=bB8KSoeaevAs&input_page_show_search=on
+```{r}
+Combinedgeneset_PPI <- string_db_human$get_interactions(Combinedgeneset_mapped$STRING_id)
+Combinedgeneset_PPI_mediumconfidence <- Combinedgeneset_PPI %>%
+  filter(combined_score>=400) %>% 
+  distinct()
+```
+
+Identify direct interactions between Trait 1 candidate proteins (GWAS FUMA genes) and Trait 2 candidate proteins (IMPC KO genes). 
+```{r}
+Combinedgeneset_PPI_mediumconfidence.from <- left_join(Combinedgeneset_PPI_mediumconfidence, Combinedgeneset_mapped, 
+                                                       by=c('from'='STRING_id'))
+Combinedgeneset_PPI_mediumconfidence.to <- left_join(Combinedgeneset_PPI_mediumconfidence.from, Combinedgeneset_mapped, 
+                                                  by=c('to'='STRING_id'))
+Combinedgeneset_PPI_mediumconfidence <- Combinedgeneset_PPI_mediumconfidence.to %>%
+  mutate(from_gene=as.factor(human_entrez.x), to_gene=as.factor(human_entrez.y)) %>%
+  dplyr::select(from_gene, to_gene, combined_score) %>%
+  distinct()
+Combinedgeneset_PPI_mediumconfidence$from_Trait1gene <- 
+  Combinedgeneset_PPI_mediumconfidence$from_gene %in% Trait1genesnames$human_entrez
+Combinedgeneset_PPI_mediumconfidence$to_Trait2gene <- 
+  Combinedgeneset_PPI_mediumconfidence$to_gene %in% Trait2genesnames$human_entrez
+Combinedgeneset_PPI_mediumconfidence$from_Trait2gene <- 
+  Combinedgeneset_PPI_mediumconfidence$from_gene %in% Trait2genesnames$human_entrez
+Combinedgeneset_PPI_mediumconfidence$to_Trait1gene <- 
+  Combinedgeneset_PPI_mediumconfidence$to_gene %in% Trait1genesnames$human_entrez
+Combinedgeneset_PPI_mediumconfidence$Trait1_Trait2connection <- (
+  Combinedgeneset_PPI_mediumconfidence$from_Trait1gene=='TRUE' & Combinedgeneset_PPI_mediumconfidence$to_Trait2gene=='TRUE') | 
+  (Combinedgeneset_PPI_mediumconfidence$from_Trait2gene=='TRUE' & Combinedgeneset_PPI_mediumconfidence$to_Trait1gene=='TRUE')
+Combinedgeneset_PPI_mediumconfidence <- Combinedgeneset_PPI_mediumconfidence %>%
+  filter(Trait1_Trait2connection=='TRUE')
+```
+
+Add gene symbols to data frame and select the below columns to create a clean data frame for downstream steps. 
+```{r}
+human.fuma.impc.ppi <- Combinedgeneset_PPI_mediumconfidence %>%
+  left_join(all.human.genes %>% dplyr::select(human_entrez, human_symbol),
+            by = c('from_gene' = 'human_entrez')) %>%
+  mutate(GeneName_from = human_symbol) %>%
+  dplyr::select(-human_symbol) 
+human.fuma.impc.ppi <- human.fuma.impc.ppi %>%
+  left_join(all.human.genes %>% dplyr::select(human_entrez, human_symbol),
+            by = c('to_gene' = 'human_entrez')) %>%
+  mutate(GeneName_to = human_symbol) %>%
+  dplyr::select(-human_symbol) 
+
+#clean data frame
+human.ppi <- human.fuma.impc.ppi %>%
+  dplyr::select(from_gene, to_gene, GeneName_from, GeneName_to)
+
+```
+To begin to narrow down the full protein-protein interaction network (PPI), count the number of times each gene appears in either the to-gene or from-gene column. You can visualize the frequency of each factor in the all.genes.ppi with the ggplot2 function.
+
+```{r}
+all.genes.in.ppi <- data.frame(genes= c(human.ppi$GeneName_from, human.ppi$GeneName_to))
+all.genes.in.ppi <- all.genes.in.ppi %>% 
+  mutate(genes = as.factor(genes)) %>% 
+  group_by(genes) %>% 
+  summarise(count = dplyr::n(), .groups = 'drop') %>% 
+  arrange(desc(count))
+
+
+histogram.of.all.genes.in.human.ppi <-  ggplot(all.genes.in.ppi, aes(x = count)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "black") +
+  labs(title = "Histogram of Frequency of Each Factor in all.genes.ppi",
+       x = "Count of 'genes'",
+       y = "Frequency") +
+   theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    strip.background = element_rect(fill = "white", color = NA)
+  )
+
+
+```
+
+To determine the cutoff for the filtered PPI, run the function summary(). Select genes that are occurring in the 75% percentile or higher. For this dataset, to include the third quantile and higher, we will select genes that are occurring seven or more times. We refer to these genes as hub genes. 
+```{r}
+counts <- summary(all.genes.in.ppi$count)
+print(counts)
+# Get the third quartile (Q3) value
+third.Qu <- quantile(all.genes.in.ppi$count, 0.75)
+```
+
+Filter the ‘all.genes.in.ppi’ data frame to include only genes in third quantile and above. 
+```{r}
+filtered.genes <- all.genes.in.ppi %>% 
+  filter(count>=third.Qu)
+bothgenesarehubs.filtered.human.ppi <- human.ppi %>%
+  filter(GeneName_from %in% filtered.genes$genes & GeneName_to %in% filtered.genes$genes)
+
+```
+
+To further prioritize genes, pull available data for drug targets from the Pharos API . 
+```{r}
+token <-Sys.getenv("GITHUB_GRAPHQL_TOKEN")
+con <- GraphqlClient$new(url = 'https://pharos-api.ncats.io/graphql')
+qry <- Query$new()
+
+qry$query('mydata', '{
+  targets(filter:{facets:[{
+    facet: "Target Development Level",
+    values: ["Tclin", "Tchem"]
+  }]
+  })
+  {
+    targets(top: 18319) {
+      sym
+      tdl}
+  }
+}')
+
+x <- con$exec(qry$queries$mydata)
+idg <- jsonlite::fromJSON(x)
+drug.targets <- data.frame(Gene.Name=idg$data$targets$targets$sym, idgTDL=idg$data$targets$targets$tdl)
+drug.targets <- drug.targets %>% 
+  mutate(Gene.Name= as.factor(Gene.Name))
+
+```
+
+Create a data frame that will further filter the hub gene PPI to now only include gene products that are drug targets.
+```{r}
+drug.targets.only.ppi <-bothgenesarehubs.filtered.human.ppi[
+  bothgenesarehubs.filtered.human.ppi$GeneName_from %in% drug.targets$Gene.Name & 
+  bothgenesarehubs.filtered.human.ppi$GeneName_to %in% drug.targets$Gene.Name, 
+]
+write.csv(drug.targets.only.ppi, './drug.target.hub.genes.only.human.ppi.csv', row.names = FALSE, quote = FALSE)
+```
+Create a table in R that will be uploaded into Cytoscape to color code nodes by the database the gene came from. Below, data from the GWAS catalog will be given a 1, IMPC 2, if there is evidence from both databases the gene will be labeled as a 3, and if there are any genes that come up from the STRINGdb search only, they will be given a 4. Write another csv file for color coding of the nodes created. 
+```{r}
+# Create vectors of Human.Symbols from each data frame
+fuma_symbols <- human.fuma.genes$human_symbol
+IMPCKO_symbols <- human.IMPCKO.genes$human_symbol
+
+# Create a combined data frame with all unique Human.Symbols
+all_symbols <- unique(c(fuma_symbols, IMPCKO_symbols))
+
+# Create the ppi.color.nodes data frame
+#create color.codes for Cytoscape for hub.ppi
+hub.gene.color.code <- bothgenesarehubs.filtered.human.ppi %>%
+  dplyr::select(GeneName_from, GeneName_to) %>%
+  pivot_longer(cols = everything(), names_to = "GeneType", values_to = "GeneName") %>%
+  distinct(GeneName)
+hub.gene.color.code <- hub.gene.color.code %>%
+  mutate(evidence.source = case_when(
+    GeneName %in% fuma_symbols & GeneName %in% IMPCKO_symbols ~ 3,
+    GeneName %in% fuma_symbols ~ 1,
+    GeneName %in% IMPCKO_symbols ~ 2,
+    TRUE ~ 4
+  ))
+#export table to color code in Cytoscape
+write.csv(hub.gene.color.code, './hub.genes.only.ppi.color.code.list.for.input.into.cytoscape.csv', row.names = FALSE, quote = FALSE)
+
+```
